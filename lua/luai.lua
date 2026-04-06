@@ -14,22 +14,19 @@ demand("my.plugin").do_something_cool {
 
 --]]
 
-local curl = require "plenary.curl"
 local path = require "luai.path"
 
 local M = {}
-
-local api_key = nil
+local config = {
+  model = "composer-2-fast",
+}
 
 -- Basepath for generated functions from luai, that are not from `demand(...)`
 local basepath = vim.fs.joinpath(vim.fn.stdpath "data" --[[@as string]], "luai", "generated")
 vim.fn.mkdir(basepath, "p")
 
--- Temp file that we use since the prompts can be very large. Curl likes this much better
-LUAI_TMP_FILE = LUAI_TMP_FILE or vim.fn.tempname()
-
 ---@class luai.Settings
----@field token string: The token to use for the anthropic API. Currently only supporting anthropic. Don't know if I'll take any PRs, btw.
+---@field model? string: Default Cursor Agent model. Defaults to `composer-2-fast`.
 
 ---@class luai.GeneratedFunction
 ---@field function_name string
@@ -44,22 +41,131 @@ LUAI_TMP_FILE = LUAI_TMP_FILE or vim.fn.tempname()
 ---@field implementation string
 
 ---@class luai.RawGeneratedFunctionResult
----@field version number
 ---@field option_list string
 ---@field option_example table
 ---@field description string
----@field thoughts string
 ---@field implementation string
 
 ---@class luai.GenerateFunctionOpts
 ---@field function_name string
 ---@field options table
 
---- Setup the luai module. This must be called before using the module.
----@param opts luai.Settings
+--- Setup the luai module. This is currently optional and kept for API compatibility.
+---@param opts? luai.Settings
 M.setup = function(opts)
-  assert(opts.token, "[luai] must have anthropic token")
-  api_key = opts.token
+  opts = opts or {}
+  config = vim.tbl_extend("force", config, opts)
+end
+
+---@param implementation string
+---@return boolean
+---@return string?
+local validate_generated_code = function(implementation)
+  local loader = loadstring or load
+  local _, err = loader(implementation)
+  if err then
+    return false, err
+  end
+
+  return true
+end
+
+---@param response_text string
+---@return string
+local normalize_generated_code = function(response_text)
+  local normalized = vim.trim(response_text)
+  if normalized == "" then
+    error "[luai] Cursor Agent returned an empty response."
+  end
+
+  local candidates = { normalized }
+
+  local fenced = normalized:match("```lua%s*(.-)%s*```") or normalized:match("```%s*(.-)%s*```")
+  if fenced then
+    table.insert(candidates, vim.trim(fenced))
+  end
+
+  local tagged = normalized:match "<lua_function>%s*(.-)%s*</lua_function>"
+  if tagged then
+    table.insert(candidates, vim.trim(tagged))
+  end
+
+  local start = normalized:find("return%s+function%s*%(")
+  if start then
+    local lines = vim.split(normalized:sub(start), "\n")
+    for last = #lines, 1, -1 do
+      local candidate_lines = {}
+      for i = 1, last do
+        table.insert(candidate_lines, lines[i])
+      end
+
+      table.insert(candidates, vim.trim(table.concat(candidate_lines, "\n")))
+    end
+  end
+
+  for _, candidate in ipairs(candidates) do
+    if candidate ~= "" and candidate:match "^return%s+function%s*%(" then
+      local ok = validate_generated_code(candidate)
+      if ok then
+        return candidate
+      end
+    end
+  end
+
+  error(string.format(
+    "[luai] Cursor Agent response did not contain valid Lua starting with `return function(opts)`:\n%s",
+    response_text
+  ))
+end
+
+---@param prompt string
+---@param model string
+---@return string
+local request_generation = function(prompt, model)
+  if vim.fn.executable "agent" ~= 1 then
+    error "[luai] Could not find `agent` on PATH. Install Cursor Agent CLI and make sure it is available in your shell."
+  end
+
+  local workspace = vim.uv.cwd() or vim.fn.getcwd()
+  local result = vim.system({
+    "agent",
+    "-p",
+    "--mode",
+    "ask",
+    "--output-format",
+    "json",
+    "--model",
+    model,
+    "--trust",
+    "--workspace",
+    workspace,
+    prompt,
+  }, { text = true }):wait()
+
+  local stdout = result.stdout or ""
+  local stderr = result.stderr or ""
+
+  if result.code ~= 0 then
+    stderr = vim.trim(stderr)
+    stdout = vim.trim(stdout)
+    local details = stderr ~= "" and stderr or stdout
+    if details ~= "" then
+      error(string.format("[luai] Cursor Agent request failed: %s", details))
+    end
+
+    error(string.format("[luai] Cursor Agent request failed with exit code %s", result.code))
+  end
+
+  local ok, decoded = pcall(vim.json.decode, stdout)
+  if not ok then
+    error(string.format("[luai] Cursor Agent returned invalid JSON:\n%s", stdout))
+  end
+
+  if type(decoded) ~= "table" or type(decoded.result) ~= "string" then
+    error(string.format("[luai] Cursor Agent JSON did not contain a string `result` field:\n%s", stdout))
+  end
+
+  return decoded.result
 end
 
 --- Get the generated file
@@ -89,6 +195,26 @@ local read_generated_file = function(filepath)
   return nil
 end
 
+---@param value any
+---@return string
+local format_json_for_history = function(value)
+  local encoded = vim.json.encode(value)
+  if vim.fn.executable "jq" ~= 1 then
+    return encoded
+  end
+
+  local result = vim.system({ "jq", "--sort-keys", "." }, {
+    stdin = encoded,
+    text = true,
+  }):wait()
+
+  if result.code ~= 0 then
+    return encoded
+  end
+
+  return vim.trim(result.stdout or "")
+end
+
 --- Write the generated file to disk
 ---@param options luai.WriteFileOptions
 local write_generate_file = function(options)
@@ -103,7 +229,7 @@ return setmetatable({
   end,
 }, { __call = function(self, ...) return self.implementation()(...) end })
 ]],
-    vim.json.encode(options.history),
+    format_json_for_history(options.history),
     options.implementation
   )
 
@@ -120,51 +246,11 @@ local generate_new_function = function(opts)
   print("[luai] generating new function:", opts.function_name)
 
   local new_prompt = require "luai.prompt"(opts)
-  local system = new_prompt.system
-  local messages = new_prompt.messages
-
-  local json_body = vim.json.encode {
-    model = "claude-3-5-sonnet-20241022",
-    stream = false,
-    max_tokens = 4096,
-    temperature = 0.1,
-    system = system,
-    messages = messages,
-    stop_sequences = { "</lua_function>" },
-  }
-
-  vim.fn.writefile(vim.split(json_body, "\n"), LUAI_TMP_FILE)
-
-  local ok, response = pcall(curl.post, {
-    timeout = 1000 * 60,
-    url = "https://api.anthropic.com/v1/messages",
-    headers = {
-      ["x-api-key"] = api_key,
-      ["content-type"] = "application/json",
-      ["anthropic-version"] = "2023-06-01",
-      ["anthropic-beta"] = "prompt-caching-2024-07-31",
-    },
-    body = LUAI_TMP_FILE,
-  })
-
-  if not ok then
-    error { error = true }
-  end
-
-  local decoded = vim.json.decode(response.body)
-  if not decoded.content then
-    error(string.format("Could not find content in response: %s", response.body))
-  end
-
-  -- print(vim.inspect(decoded.usage))
-  local text = decoded.content[1].text
-
-  -- get everything after <lua_function>
-  local thoughts = vim.trim(text:match "(.*)<lua_function>")
-  local implementation = vim.trim(text:match "<lua_function>(.*)")
+  local model = opts.options.__model or config.model
+  local response_text = request_generation(new_prompt.prompt, model)
+  local implementation = normalize_generated_code(response_text)
 
   return {
-    thoughts = thoughts,
     implementation = implementation,
     description = new_prompt.description,
     option_list = new_prompt.option_list,
@@ -189,6 +275,21 @@ end
 
 local function get_module_path(module) end
 
+---@param options table
+---@param latest_history luai.RawGeneratedFunctionResult
+local add_previous_implementation_context = function(options, latest_history)
+  ---@diagnostic disable-next-line: inject-field
+  options.__history = string.format(
+    [[
+Here is the previous implementation. Keep the parts that are still correct and update it to satisfy the new request.
+
+Previous implementation:
+%s
+]],
+    latest_history.implementation
+  )
+end
+
 local store_new_function = function(filepath, key, new_function)
   ---@type luai.WriteFileOptions
   local generated = {
@@ -196,10 +297,8 @@ local store_new_function = function(filepath, key, new_function)
     filepath = filepath,
     history = {
       {
-        version = 1,
         option_list = new_function.option_list,
         option_example = new_function.option_example,
-        thoughts = new_function.thoughts,
         description = new_function.description,
         implementation = new_function.implementation,
       },
@@ -224,23 +323,7 @@ local update_existing_generation = function(filepath, function_name, value)
     error "Unsupported type"
   end
 
-  ---@diagnostic disable-next-line: inject-field
-  options.__history = string.format(
-    [[
-Previously, you thought:
-
-<previous_thoughts>
-%s
-</previous_thoughts>
-
-And you generated the implementation:
-<previous_implementation>
-%s
-</previous_implementation>
-]],
-    latest_history.thoughts,
-    latest_history.implementation
-  )
+  add_previous_implementation_context(options, latest_history)
 
   local updated = generate_new_function {
     function_name = function_name,
@@ -249,10 +332,8 @@ And you generated the implementation:
 
   local history = vim.deepcopy(generated.history)
   table.insert(history, {
-    version = 1,
     option_list = updated.option_list,
     option_example = vim.json.encode(updated.option_example),
-    thoughts = updated.thoughts,
     description = updated.description,
     implementation = updated.implementation,
   })
@@ -351,23 +432,7 @@ function Generated:__newindex(key, value)
     error "Unsupported type"
   end
 
-  ---@diagnostic disable-next-line: inject-field
-  options.__history = string.format(
-    [[
-Previously, you thought:
-
-<previous_thoughts>
-%s
-</previous_thoughts>
-
-And you generated the implementation:
-<previous_implementation>
-%s
-</previous_implementation>
-]],
-    latest_history.thoughts,
-    latest_history.implementation
-  )
+  add_previous_implementation_context(options, latest_history)
 
   local updated = generate_new_function {
     function_name = key,
@@ -376,10 +441,8 @@ And you generated the implementation:
 
   local history = vim.deepcopy(generated.history)
   table.insert(history, {
-    version = 1,
     option_list = updated.option_list,
     option_example = vim.json.encode(updated.option_example),
-    thoughts = updated.thoughts,
     description = updated.description,
     implementation = updated.implementation,
   })
@@ -452,45 +515,117 @@ M._require_init = function(module)
   })
 end
 
-M.improve_select = function()
-  local possible_inits = vim.api.nvim_get_runtime_file("lua/**/init.lua", true)
+local generated_module_pattern = '^return require%("luai"%)%._require_init%("([^"]+)"%)'
 
-  local generated_inits = {}
+---@return table[]
+local get_generated_modules = function()
+  local possible_inits = vim.api.nvim_get_runtime_file("lua/**/init.lua", true)
+  local items = {}
   for _, file in ipairs(possible_inits) do
     local lines = vim.fn.readfile(file)
-    if vim.startswith(lines[1], 'return require("luai")._require_init("') then
-      table.insert(generated_inits, file)
+    local module = lines[1] and lines[1]:match(generated_module_pattern)
+    if module then
+      table.insert(items, {
+        module = module,
+        dir = vim.fn.fnamemodify(file, ":h"),
+        init = file,
+      })
     end
   end
 
-  local items = {}
-  for _, init in ipairs(generated_inits) do
-    local dir = vim.fn.fnamemodify(init, ":h")
-    local dirparts = vim.split(dir, "/lua/", { plain = true })
-    table.remove(dirparts, 1)
-    local module = table.concat(dirparts, "."):gsub("/", ".")
+  table.sort(items, function(left, right)
+    return left.module < right.module
+  end)
 
-    for file in vim.fs.dir(dir) do
-      if file ~= "init.lua" then
-        table.insert(items, {
-          module = module,
-          fn = vim.fn.fnamemodify(file, ":r"),
-          path = vim.fs.joinpath(dir, file),
-        })
-      end
+  return items
+end
+
+---@param module_item table
+---@return table[]
+local get_generated_functions_for_module = function(module_item)
+  local items = {}
+  for file, filetype in vim.fs.dir(module_item.dir) do
+    if filetype == "file" and file ~= "init.lua" and vim.endswith(file, ".lua") then
+      table.insert(items, {
+        module = module_item.module,
+        fn = vim.fn.fnamemodify(file, ":r"),
+        path = vim.fs.joinpath(module_item.dir, file),
+      })
     end
+  end
+
+  table.sort(items, function(left, right)
+    return left.fn < right.fn
+  end)
+
+  return items
+end
+
+---@param module string|table
+---@return table?
+local resolve_generated_module = function(module)
+  if type(module) == "table" then
+    return module
+  end
+
+  for _, item in ipairs(get_generated_modules()) do
+    if item.module == module then
+      return item
+    end
+  end
+end
+
+---@param choice table
+local prompt_for_improvement = function(choice)
+  vim.schedule(function()
+    local improvement = vim.fn.input(string.format('Improve `require("%s").%s`: ', choice.module, choice.fn))
+    if improvement == nil or vim.trim(improvement) == "" then
+      return
+    end
+
+    M.improve(choice.module)[choice.fn] = improvement
+  end)
+end
+
+---@param module string|table
+M.improve_module_select = function(module)
+  local module_item = resolve_generated_module(module)
+  assert(module_item, string.format("[luai] Could not find generated module: %s", module))
+
+  local items = get_generated_functions_for_module(module_item)
+  if vim.tbl_isempty(items) then
+    vim.notify(string.format("[luai] No generated functions found for %s", module_item.module))
+    return
   end
 
   vim.ui.select(items, {
-    prompt = "Which function to improve?",
+    prompt = string.format("Which function in %s should be improved?", module_item.module),
     format_item = function(choice)
       return string.format('require("%s").%s', choice.module, choice.fn)
     end,
   }, function(choice)
     if choice then
+      prompt_for_improvement(choice)
+    end
+  end)
+end
+
+M.improve_select = function()
+  local items = get_generated_modules()
+  if vim.tbl_isempty(items) then
+    vim.notify "[luai] No generated modules found on runtimepath."
+    return
+  end
+
+  vim.ui.select(items, {
+    prompt = "Which module should be improved?",
+    format_item = function(choice)
+      return choice.module
+    end,
+  }, function(choice)
+    if choice then
       vim.schedule(function()
-        local improvement = vim.fn.input "Improvement Prompt: "
-        M.improve(choice.module)[choice.fn] = improvement
+        M.improve_module_select(choice)
       end)
     end
   end)

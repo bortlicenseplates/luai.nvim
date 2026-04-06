@@ -4,14 +4,23 @@ Generate, Demand, and Improve Lua Functions on the fly.
 
 ## Setup
 
+`luai.nvim` now uses the local Cursor Agent CLI for generation. Make sure `agent` is installed, available on your `PATH`, and already authenticated before using the plugin.
+
 ```lua
--- Required:
 require("luai").setup {
-    -- Right now, I only support anthropic because we use some of the caching stuff.
-    -- I don't care, you can send a PR and maybe I won't reject (but likely will).
-    token = "ANTHROPIC_TOKEN"
+  model = "composer-2-fast",
 }
 ```
+
+Internally, `luai.nvim` invokes Cursor Agent in headless ask mode and consumes JSON output:
+
+```bash
+agent -p --mode ask --output-format json --model composer-2-fast --trust --workspace "$PWD" "<prompt>"
+```
+
+The plugin reads the `.result` field from that JSON response and expects raw Lua code that starts with `return function(opts)` and ends with `end`.
+If the agent accidentally returns fenced Lua or a small amount of prose before the code, `luai.nvim` will try to normalize that automatically.
+You can override the default model for any single generation by passing `__model` in the opts table, for example `generate.some_fn { __model = "gpt-5.4-medium-fast" }`.
 
 ## Usage
 
@@ -67,6 +76,6 @@ This will lead you through several prompts and then generate the code, where you
 ```
 
 This will open up a selection window for you to select from
-all the generated functions you have made so far, and then you
-can give it the prompt to fix any existing problems that you have
-with the function.
+the generated modules on your runtimepath, then a second selection
+for the generated functions inside that module, and finally it will
+prompt you for what you want improved.

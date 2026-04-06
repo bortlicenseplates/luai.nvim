@@ -10,24 +10,37 @@ reload "luai.path"
 reload "luai.utils"
 reload "luai.utils.split_string_on_vowels"
 
-local dotenv = require "custom.dotenv"
-local parsed = dotenv.parse ".env"
-require("luai").setup {
-  token = parsed.ANTHROPIC_TOKEN,
-}
+require("luai").setup()
 
 -- require("luai").improve_select()
 
 -- local improve = require("luai").improve
 -- improve("luai.utils").greet_a_friend_in_a_popup_window =
---   "The background should ONLY be set for the popup window itself. Not anyewhere else."
-
+--   "The background should ONLY be set for the popup window itself. Not anyewhere else."''
 local demand = require("luai").demand
-local result = demand("luai.utils").greet_a_friend_in_a_popup_window {
-  friend_name = "janetacarr",
-  background = "green",
-}
+-- demand("luai.utils").greet_a_friend_in_a_popup_window {
+--   __description = "Create a floating window with a border, include simple keybinds as well.",
+--
+--   friend_name = "omacon friends",
+--   background = "blue",
+-- }
 -- print(vim.inspect(result))
+-- demand("luai.utils").change_omarchy_theme_to_gruvbox {
+--   __description = "I am on omarchy right now. I want the theme to just automagically change to grubox when i run this function.",
+-- }
+-- demand("luai.utils").change_omarch_theme {
+--   theme = "lumon",
+-- }
+--
+-- demand("luai.utils").change_omarchy_current_theme {
+--   theme = "gruvbox",
+-- }
+
+demand("luai.utils").next_omarchy_background {
+  __description = "move to the next omarchy background for the current theme",
+}
+
+-- require("luai").improve_select()
 
 -- generate.select_random_neovim_colorscheme {}
 
