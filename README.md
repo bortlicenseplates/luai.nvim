@@ -4,23 +4,23 @@ Generate, Demand, and Improve Lua Functions on the fly.
 
 ## Setup
 
-`luai.nvim` now uses the local Cursor Agent CLI for generation. Make sure `agent` is installed, available on your `PATH`, and already authenticated before using the plugin.
+This fork uses the local Pi CLI for generation. Make sure `pi` is installed, available on your `PATH`, and already authenticated before using the plugin.
 
 ```lua
 require("luai").setup {
-  model = "composer-2-fast",
+  model = "anthropic/claude-sonnet-4-6",
 }
 ```
 
-Internally, `luai.nvim` invokes Cursor Agent in headless ask mode and consumes JSON output:
+Internally, `luai.nvim` invokes Pi in non-interactive JSON mode with a plugin-local system prompt:
 
 ```bash
-agent -p --mode ask --output-format json --model composer-2-fast --trust --workspace "$PWD" "<prompt>"
+PI_CODING_AGENT_DIR="$PLUGIN_ROOT/.pi" pi -p --mode json --model anthropic/claude-sonnet-4-6 --no-tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-session --append-system-prompt "$PLUGIN_ROOT/pi/luai-system-prompt.md" "<prompt>"
 ```
 
-The plugin reads the `.result` field from that JSON response and expects raw Lua code that starts with `return function(opts)` and ends with `end`.
-If the agent accidentally returns fenced Lua or a small amount of prose before the code, `luai.nvim` will try to normalize that automatically.
-You can override the default model for any single generation by passing `__model` in the opts table, for example `generate.some_fn { __model = "gpt-5.4-medium-fast" }`.
+The plugin reads the final assistant text from Pi's JSON event stream and treats it like Cursor Agent's former `.result` field. The response is expected to be raw Lua code that starts with `return function(opts)` and ends with `end`.
+If Pi accidentally returns fenced Lua or a small amount of prose before the code, `luai.nvim` will try to normalize that automatically.
+You can override the default model for any single generation by passing `__model` in the opts table, for example `generate.some_fn { __model = "anthropic/claude-opus-4-7" }`.
 
 ## Usage
 
