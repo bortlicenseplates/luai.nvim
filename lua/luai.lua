@@ -18,7 +18,7 @@ local path = require "luai.path"
 
 local M = {}
 local config = {
-  model = "composer-2-fast",
+  model = "anthropic/claude-sonnet-4-6",
 }
 
 -- Basepath for generated functions from luai, that are not from `demand(...)`
@@ -26,7 +26,7 @@ local basepath = vim.fs.joinpath(vim.fn.stdpath "data" --[[@as string]], "luai",
 vim.fn.mkdir(basepath, "p")
 
 ---@class luai.Settings
----@field model? string: Default Cursor Agent model. Defaults to `composer-2-fast`.
+---@field model? string: Default Pi model. Defaults to `anthropic/claude-sonnet-4-6`.
 
 ---@class luai.GeneratedFunction
 ---@field function_name string
@@ -75,7 +75,7 @@ end
 local normalize_generated_code = function(response_text)
   local normalized = vim.trim(response_text)
   if normalized == "" then
-    error "[luai] Cursor Agent returned an empty response."
+    error "[luai] Pi returned an empty response."
   end
 
   local candidates = { normalized }
@@ -113,7 +113,7 @@ local normalize_generated_code = function(response_text)
   end
 
   error(string.format(
-    "[luai] Cursor Agent response did not contain valid Lua starting with `return function(opts)`:\n%s",
+    "[luai] Pi response did not contain valid Lua starting with `return function(opts)`:\n%s",
     response_text
   ))
 end
@@ -122,25 +122,34 @@ end
 ---@param model string
 ---@return string
 local request_generation = function(prompt, model)
-  if vim.fn.executable "agent" ~= 1 then
-    error "[luai] Could not find `agent` on PATH. Install Cursor Agent CLI and make sure it is available in your shell."
+  if vim.fn.executable "pi" ~= 1 then
+    error "[luai] Could not find `pi` on PATH. Install Pi and make sure it is available in your shell."
   end
 
-  local workspace = vim.uv.cwd() or vim.fn.getcwd()
+  local plugin_root = vim.fs.dirname(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)))
   local result = vim.system({
-    "agent",
+    "pi",
     "-p",
     "--mode",
-    "ask",
-    "--output-format",
     "json",
     "--model",
     model,
-    "--trust",
-    "--workspace",
-    workspace,
+    "--no-tools",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
+    "--no-session",
+    "--append-system-prompt",
+    vim.fs.joinpath(plugin_root, "pi", "luai-system-prompt.md"),
     prompt,
-  }, { text = true }):wait()
+  }, {
+    env = {
+      PI_CODING_AGENT_DIR = vim.fs.joinpath(plugin_root, ".pi"),
+    },
+    text = true,
+  }):wait()
 
   local stdout = result.stdout or ""
   local stderr = result.stderr or ""
@@ -150,22 +159,32 @@ local request_generation = function(prompt, model)
     stdout = vim.trim(stdout)
     local details = stderr ~= "" and stderr or stdout
     if details ~= "" then
-      error(string.format("[luai] Cursor Agent request failed: %s", details))
+      error(string.format("[luai] Pi request failed: %s", details))
     end
 
-    error(string.format("[luai] Cursor Agent request failed with exit code %s", result.code))
+    error(string.format("[luai] Pi request failed with exit code %s", result.code))
   end
 
-  local ok, decoded = pcall(vim.json.decode, stdout)
-  if not ok then
-    error(string.format("[luai] Cursor Agent returned invalid JSON:\n%s", stdout))
+  local final_message
+  for _, line in ipairs(vim.split(stdout, "\n", { trimempty = true })) do
+    local ok, decoded = pcall(vim.json.decode, line)
+    if ok and type(decoded) == "table" and decoded.type == "agent_end" then
+      final_message = decoded.messages and decoded.messages[#decoded.messages]
+    end
   end
 
-  if type(decoded) ~= "table" or type(decoded.result) ~= "string" then
-    error(string.format("[luai] Cursor Agent JSON did not contain a string `result` field:\n%s", stdout))
+  if type(final_message) ~= "table" or type(final_message.content) ~= "table" then
+    error(string.format("[luai] Pi JSON did not contain a final assistant message:\n%s", stdout))
   end
 
-  return decoded.result
+  local parts = {}
+  for _, item in ipairs(final_message.content) do
+    if item.type == "text" and type(item.text) == "string" then
+      table.insert(parts, item.text)
+    end
+  end
+
+  return table.concat(parts, "\n")
 end
 
 --- Get the generated file
